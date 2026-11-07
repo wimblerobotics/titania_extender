@@ -1,0 +1,20 @@
+# Move one extender motor to a position, in encoder counts (QPPS counts).
+#
+# If 'relative' is true, 'position' is an offset from the current encoder
+# value; otherwise it is an absolute encoder position. The target is clamped
+# to the motor's configured min/max position limits.
+#
+# speed, accel and decel override the configured defaults when non-zero.
+int32 position
+bool relative false
+uint32 speed 0      # quad pulses per second, 0 => use YAML default
+uint32 accel 0      # quad pulses per second^2, 0 => use YAML default
+uint32 decel 0      # quad pulses per second^2, 0 => use YAML default
+---
+bool success
+string message
+int32 final_position    # encoder counts
+---
+int32 current_position  # encoder counts
+int32 current_speed     # quad pulses per second
+int32 remaining_counts  # target - current_position

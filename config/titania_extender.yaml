@@ -1,0 +1,118 @@
+# Configuration for the titania_extender driver node.
+#
+# The RoboClaw drives the two motors of Titania's gripper extender assembly:
+#   M1 ("rotate"): rotates the extender.
+#   M2 ("extend"): extends/retracts the box tube extender.
+#
+# PID values were derived with Basic Micro Motion Studio. See:
+# https://resources.basicmicro.com/auto-tuning-with-motion-studio/
+#
+# All positions, speeds and accelerations are in quadrature pulses
+# (encoder counts) and quad pulses per second (QPPS).
+
+titania_extender_node:
+  ros__parameters:
+    # ----- RoboClaw connection -------------------------------------------
+    # USB device on the Raspberry Pi 5. Consider a persistent udev name
+    # (e.g. /dev/roboclaw) so re-enumeration doesn't change the path.
+    device_name: "/dev/ttyACM0"
+    baud_rate: 38400        # Ignored for USB CDC-ACM, kept for UART use.
+    device_port: 128        # RoboClaw packet-serial address (0x80).
+
+    # ----- Publishing / monitoring ---------------------------------------
+    sensor_rate_hz: 10.0    # Status / angle / length publish rate.
+
+    # Action monitoring.
+    goal_tolerance: 10      # Counts. |target - encoder| <= tolerance => done.
+    goal_timeout_seconds: 30.0
+
+    # If no serial activity in this time, the watchdog re-reads status to
+    # keep the connection verified.
+    # (The RoboClaw position mode holds position on its own; the driver
+    # does not need to stream commands.)
+
+    # ----- Motor 1: extender rotation ------------------------------------
+    rotate:
+      # Velocity PID (RoboClaw commands 28). From Motion Studio autotune.
+      velocity_p: 12.57797
+      velocity_i: 0.51691
+      velocity_d: 0.0
+      qpps: 2640            # Max speed of motor in quad pulses per second.
+
+      # Position PID (RoboClaw command 61). Initialized from the same
+      # values; retune with Motion Studio position autotune if needed.
+      position_p: 12.57797
+      position_i: 0.51691
+      position_d: 0.0
+      position_max_i: 0     # Max integral windup (0 = unlimited per manual).
+      position_deadzone: 10 # Counts. No correction inside this band.
+
+      min_position: -2800   # Counts.
+      max_position: 3000    # Counts.
+
+      speed: 1000           # Default move speed, QPPS.
+      accel: 1000           # Default acceleration, QPPS/s.
+      decel: 1000           # Default deceleration, QPPS/s.
+
+      max_current: 6.0      # Amps; exceeded => warning + abort active goal.
+
+      # Calibration: encoder counts per degree of rotation. 0.0 disables
+      # the encoder-derived rotation_angle topic value (publishes NaN).
+      counts_per_degree: 0.0
+
+    # ----- Motor 2: box tube extension -----------------------------------
+    extend:
+      velocity_p: 14.1
+      velocity_i: 0.6
+      velocity_d: 0.0
+      qpps: 2640
+
+      position_p: 14.1
+      position_i: 0.6
+      position_d: 0.0
+      position_max_i: 0
+      position_deadzone: 10
+
+      min_position: -10000
+      max_position: 4700
+
+      speed: 18000
+      accel: 2000
+      decel: 2000
+
+      max_current: 6.0
+
+      # Calibration: encoder counts per meter of extension. 0.0 disables
+      # the encoder-derived extension_length topic value (publishes NaN).
+      counts_per_meter: 0.0
+
+    # ----- BNO055 IMU (dummy until hardware is connected) ----------------
+    imu:
+      enabled: false
+      # TODO: i2c bus/address and mounting pose relative to the rotation
+      # axis will be specified later. The gravity vector will provide the
+      # extender rotation angle.
+      i2c_bus: 1
+      i2c_address: 40       # 0x28
+
+    # ----- VL53L4CD time-of-flight sensor (dummy) -------------------------
+    tof:
+      enabled: false
+      # TODO: mounting position of the sensor and reflector offset will be
+      # specified later. Measures distance from a fixed point on the
+      # extender to a reflector on the end of the extender.
+      i2c_bus: 1
+      i2c_address: 41       # 0x29
+      mount_offset_meters: 0.0
+
+    # ----- Limit switches (dummy; optical or hall-effect, 3-pin) ----------
+    limit_switches:
+      enabled: false
+      # TODO: GPIO pin assignments to be specified later.
+      rotate_min_pin: -1
+      rotate_max_pin: -1
+      extend_min_pin: -1
+      extend_max_pin: -1
+
+    # ----- Debugging -------------------------------------------------------
+    do_debug: false
