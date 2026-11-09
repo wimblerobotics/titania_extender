@@ -11,6 +11,7 @@ Usage:
 
 Then run the driver with device_name set to the link path.
 """
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 import os
@@ -31,10 +32,11 @@ def crc16(data: bytes) -> int:
 
 
 class Motor:
+
     def __init__(self):
         self.position = 0.0
         self.target = 0.0
-        self.speed = 0.0          # commanded speed magnitude, qpps
+        self.speed = 0.0  # commanded speed magnitude, qpps
         self.moving = False
         self.last_update = time.monotonic()
 
@@ -61,12 +63,17 @@ class Motor:
 
 # Data lengths (bytes) for supported write commands.
 WRITE_LENGTHS = {
-    20: 0,            # reset encoders
-    22: 4, 23: 4,     # set encoder value
-    28: 16, 29: 16,   # set velocity PID
-    32: 2, 33: 2,     # duty
-    61: 28, 62: 28,   # set position PID
-    65: 17, 66: 17,   # speed/accel/deccel/position
+    20: 0,  # reset encoders
+    22: 4,
+    23: 4,  # set encoder value
+    28: 16,
+    29: 16,  # set velocity PID
+    32: 2,
+    33: 2,  # duty
+    61: 28,
+    62: 28,  # set position PID
+    65: 17,
+    66: 17,  # speed/accel/deccel/position
 }
 
 ADDRESS = 0x80
@@ -74,6 +81,7 @@ VERSION = b"RoboClaw Emulator v1.0\n"
 
 
 class Emulator:
+
     def __init__(self, link: str):
         self.master, slave = os.openpty()
         slave_name = os.ttyname(slave)
@@ -138,23 +146,22 @@ class Emulator:
             motor = self.motors[(command - 16) % 2]
             motor.update()
             if command in (16, 17):
-                self.reply_read(
-                    command, struct.pack(">iB", int(motor.position), 0))
+                self.reply_read(command,
+                                struct.pack(">iB", int(motor.position), 0))
             else:
-                self.reply_read(
-                    command, struct.pack(">iB", motor.velocity, 0))
+                self.reply_read(command, struct.pack(">iB", motor.velocity, 0))
             return
         if command == 24:
-            self.reply_read(command, struct.pack(">H", 126))   # 12.6 V
+            self.reply_read(command, struct.pack(">H", 126))  # 12.6 V
         elif command == 25:
-            self.reply_read(command, struct.pack(">H", 50))    # 5.0 V
+            self.reply_read(command, struct.pack(">H", 50))  # 5.0 V
         elif command == 47:
             buffers = bytes(0x80 if not m.moving else 0 for m in self.motors)
             self.reply_read(command, buffers)
         elif command == 49:
             self.reply_read(command, struct.pack(">hh", 42, 17))  # amps*100
         elif command == 82:
-            self.reply_read(command, struct.pack(">H", 312))   # 31.2 C
+            self.reply_read(command, struct.pack(">H", 312))  # 31.2 C
         elif command == 90:
             self.reply_read(command, struct.pack(">I", 0))
         else:
@@ -174,7 +181,8 @@ class Emulator:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--link", default="/tmp/roboclaw_emu",
+    parser.add_argument("--link",
+                        default="/tmp/roboclaw_emu",
                         help="Symlink to create for the emulated device.")
     args = parser.parse_args()
     Emulator(args.link).run()

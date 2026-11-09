@@ -13,9 +13,8 @@
 titania_extender_node:
   ros__parameters:
     # ----- RoboClaw connection -------------------------------------------
-    # USB device on the Raspberry Pi 5. Consider a persistent udev name
-    # (e.g. /dev/roboclaw) so re-enumeration doesn't change the path.
-    device_name: "/dev/ttyACM0"
+    # Persistent USB device name installed by the udev rule in the README.
+    device_name: "/dev/roboclaw"
     baud_rate: 38400        # Ignored for USB CDC-ACM, kept for UART use.
     device_port: 128        # RoboClaw packet-serial address (0x80).
 
@@ -86,23 +85,29 @@ titania_extender_node:
       # the encoder-derived extension_length topic value (publishes NaN).
       counts_per_meter: 0.0
 
-    # ----- BNO055 IMU (dummy until hardware is connected) ----------------
+    # ----- BNO055 IMU -----------------------------------------------------
     imu:
-      enabled: false
-      # TODO: i2c bus/address and mounting pose relative to the rotation
-      # axis will be specified later. The gravity vector will provide the
-      # extender rotation angle.
+      enabled: true
       i2c_bus: 1
       i2c_address: 40       # 0x28
+      # If no reference is configured, the orientation at node startup is
+      # captured as zero. Place the extender at its zero-angle position first.
+      # Copy the logged /imu/data orientation here to preserve that reference.
+      zero_orientation_set: false
+      zero_orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0
 
-    # ----- VL53L4CD time-of-flight sensor (dummy) -------------------------
+    # ----- VL53L4CD time-of-flight sensor -------------------------------
     tof:
-      enabled: false
-      # TODO: mounting position of the sensor and reflector offset will be
-      # specified later. Measures distance from a fixed point on the
-      # extender to a reflector on the end of the extender.
+      enabled: true
       i2c_bus: 1
       i2c_address: 41       # 0x29
+      beam_angle_degrees: 9.0
+      # Raw range is published on extender_tof/range. extension_length
+      # projects it onto the tube axis, then subtracts this calibrated offset.
       mount_offset_meters: 0.0
 
     # ----- Limit switches (dummy; optical or hall-effect, 3-pin) ----------

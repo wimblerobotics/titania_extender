@@ -9,8 +9,8 @@ int32 speed               # measured speed, quad pulses per second
 float32 current           # motor current, amps
 float32 temperature       # RoboClaw board temperature, degrees C
 float32 main_battery_voltage
-uint32 error_status       # RoboClaw error bit mask
-string error_string       # decoded error bits
+uint32 error_status       # Low 16 bits: errors; high 16 bits: warnings
+string error_string       # decoded errors and warnings
 
 int32 target_position     # last commanded target, encoder counts
 bool move_active          # true while an action goal is executing

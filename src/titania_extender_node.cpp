@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // titania_extender_node: ROS 2 driver for the gripper extender assembly of
 // the Titania robot.
 //
@@ -16,26 +17,31 @@
 //     rotate/status, extend/status   (titania_extender/msg/MotorStatus)
 //     rotation_angle                 (std_msgs/Float32, degrees)
 //     extension_length               (std_msgs/Float32, meters)
+//   imu/data, imu/gravity, extender_tof/range, extender_tof/range_status
 //   Services:
 //     home            (std_srvs/Trigger)  -- dummy, not yet implemented
 //     reset_encoders  (std_srvs/Trigger)
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <string>
-#include <thread>
-
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/range.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <string>
+#include <thread>
 
 #include "titania_extender/action/move_to_position.hpp"
 #include "titania_extender/bno055.hpp"
@@ -105,6 +111,8 @@ class MotorContext {
 };
 
 class TitaniaExtenderNode : public rclcpp::Node {
+  static constexpr double kPi = 3.14159265358979323846;
+
  public:
   TitaniaExtenderNode() : rclcpp::Node("titania_extender_node") {
     declareParameters();
@@ -114,6 +122,13 @@ class TitaniaExtenderNode : public rclcpp::Node {
     connectRoboClaw();
     initializeSensors();
 
+    imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("imu/data", 10);
+    gravity_pub_ =
+        create_publisher<geometry_msgs::msg::Vector3Stamped>("imu/gravity", 10);
+    tof_range_pub_ =
+        create_publisher<sensor_msgs::msg::Range>("extender_tof/range", 10);
+    tof_status_pub_ =
+        create_publisher<std_msgs::msg::UInt8>("extender_tof/range_status", 10);
     rotation_angle_pub_ =
         create_publisher<std_msgs::msg::Float32>("rotation_angle", 10);
     extension_length_pub_ =
@@ -135,9 +150,9 @@ class TitaniaExtenderNode : public rclcpp::Node {
         });
 
     const double sensor_rate_hz = get_parameter("sensor_rate_hz").as_double();
-    status_timer_ = create_wall_timer(
-        std::chrono::duration<double>(1.0 / sensor_rate_hz),
-        [this]() { publishStatus(); });
+    status_timer_ =
+        create_wall_timer(std::chrono::duration<double>(1.0 / sensor_rate_hz),
+                          [this]() { publishStatus(); });
 
     RCLCPP_INFO(get_logger(), "titania_extender_node ready");
   }
@@ -146,7 +161,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
     if (roboclaw_) {
       try {
         roboclaw_->stopAll();
-      } catch (const RoboClawError &e) {
+      } catch (const RoboClawError& e) {
         RCLCPP_WARN(get_logger(), "stopAll on shutdown failed: %s", e.what());
       }
     }
@@ -156,7 +171,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
   // ----- Parameter handling ----------------------------------------------
 
   void declareParameters() {
-    declare_parameter("device_name", "/dev/ttyACM0");
+    declare_parameter("device_name", "/dev/roboclaw");
     declare_parameter("baud_rate", 38400);
     declare_parameter("device_port", 128);
     declare_parameter("sensor_rate_hz", 10.0);
@@ -187,10 +202,16 @@ class TitaniaExtenderNode : public rclcpp::Node {
     declare_parameter("imu.enabled", false);
     declare_parameter("imu.i2c_bus", 1);
     declare_parameter("imu.i2c_address", 0x28);
+    declare_parameter("imu.zero_orientation_set", false);
+    declare_parameter("imu.zero_orientation.x", 0.0);
+    declare_parameter("imu.zero_orientation.y", 0.0);
+    declare_parameter("imu.zero_orientation.z", 0.0);
+    declare_parameter("imu.zero_orientation.w", 1.0);
 
     declare_parameter("tof.enabled", false);
     declare_parameter("tof.i2c_bus", 1);
     declare_parameter("tof.i2c_address", 0x29);
+    declare_parameter("tof.beam_angle_degrees", 0.0);
     declare_parameter("tof.mount_offset_meters", 0.0);
 
     declare_parameter("limit_switches.enabled", false);
@@ -200,9 +221,9 @@ class TitaniaExtenderNode : public rclcpp::Node {
     declare_parameter("limit_switches.extend_max_pin", -1);
   }
 
-  void loadMotorConfig(MotorContext &context, const std::string &name,
+  void loadMotorConfig(MotorContext& context, const std::string& name,
                        RoboClaw::Motor motor, LimitSwitches::Axis axis) {
-    MotorConfig &config = context.config;
+    MotorConfig& config = context.config;
     config.name = name;
     config.motor = motor;
     config.axis = axis;
@@ -240,20 +261,20 @@ class TitaniaExtenderNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "Connected to RoboClaw: %s",
                 roboclaw_->getVersion().c_str());
 
-    for (MotorContext *context : {&rotate_, &extend_}) {
-      const MotorConfig &config = context->config;
+    for (MotorContext* context : {&rotate_, &extend_}) {
+      const MotorConfig& config = context->config;
       roboclaw_->setVelocityPid(config.motor,
                                 static_cast<float>(config.velocity_p),
                                 static_cast<float>(config.velocity_i),
                                 static_cast<float>(config.velocity_d),
                                 static_cast<uint32_t>(config.qpps));
-      roboclaw_->setPositionPid(
-          config.motor, static_cast<float>(config.position_p),
-          static_cast<float>(config.position_i),
-          static_cast<float>(config.position_d),
-          static_cast<uint32_t>(config.position_max_i),
-          static_cast<uint32_t>(config.position_deadzone),
-          config.min_position, config.max_position);
+      roboclaw_->setPositionPid(config.motor,
+                                static_cast<float>(config.position_p),
+                                static_cast<float>(config.position_i),
+                                static_cast<float>(config.position_d),
+                                static_cast<uint32_t>(config.position_max_i),
+                                static_cast<uint32_t>(config.position_deadzone),
+                                config.min_position, config.max_position);
       RCLCPP_INFO(get_logger(),
                   "%s (M%d): vel PID %.5f/%.5f/%.5f qpps=%d, pos PID "
                   "%.5f/%.5f/%.5f range [%d, %d]",
@@ -272,25 +293,53 @@ class TitaniaExtenderNode : public rclcpp::Node {
   }
 
   void initializeSensors() {
+    imu_zero_orientation_set_ =
+        get_parameter("imu.zero_orientation_set").as_bool();
+    if (imu_zero_orientation_set_) {
+      imu_zero_orientation_ = {
+          get_parameter("imu.zero_orientation.x").as_double(),
+          get_parameter("imu.zero_orientation.y").as_double(),
+          get_parameter("imu.zero_orientation.z").as_double(),
+          get_parameter("imu.zero_orientation.w").as_double()};
+      const double norm = quaternionNorm(imu_zero_orientation_);
+      if (norm < 1e-6) {
+        RCLCPP_WARN(get_logger(),
+                    "Configured IMU zero quaternion is invalid; capturing "
+                    "the startup orientation instead");
+        imu_zero_orientation_set_ = false;
+      } else {
+        for (double& component : imu_zero_orientation_) {
+          component /= norm;
+        }
+      }
+    }
+
     imu_ = std::make_unique<Bno055>(
         get_parameter("imu.i2c_bus").as_int(),
         static_cast<uint8_t>(get_parameter("imu.i2c_address").as_int()),
         get_parameter("imu.enabled").as_bool());
     if (!imu_->initialize()) {
-      RCLCPP_WARN(get_logger(),
-                  "BNO055 IMU not available (dummy implementation); "
-                  "rotation_angle will use encoder calibration or NaN");
+      RCLCPP_WARN(get_logger(), "BNO055 IMU unavailable: %s",
+                  imu_->lastError().c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "BNO055 initialized in IMUPLUS mode");
+      if (auto sample = imu_->readSample()) {
+        logImuSample(*sample);
+        if (!imu_zero_orientation_set_) {
+          captureImuZero(*sample);
+        }
+      }
     }
 
     tof_ = std::make_unique<Vl53l4cd>(
         get_parameter("tof.i2c_bus").as_int(),
         static_cast<uint8_t>(get_parameter("tof.i2c_address").as_int()),
-        get_parameter("tof.mount_offset_meters").as_double(),
         get_parameter("tof.enabled").as_bool());
     if (!tof_->initialize()) {
-      RCLCPP_WARN(get_logger(),
-                  "VL53L4CD not available (dummy implementation); "
-                  "extension_length will use encoder calibration or NaN");
+      RCLCPP_WARN(get_logger(), "VL53L4CD unavailable: %s",
+                  tof_->lastError().c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "VL53L4CD initialized and ranging");
     }
 
     limit_switches_ = std::make_unique<LimitSwitches>(
@@ -306,10 +355,87 @@ class TitaniaExtenderNode : public rclcpp::Node {
     }
   }
 
+  static double quaternionNorm(const std::array<double, 4>& quaternion) {
+    double sum = 0.0;
+    for (double component : quaternion) {
+      sum += component * component;
+    }
+    return std::sqrt(sum);
+  }
+
+  void logImuSample(const Bno055::Sample& sample) {
+    RCLCPP_INFO(get_logger(),
+                "IMU orientation x=%.6f y=%.6f z=%.6f w=%.6f; gravity "
+                "x=%.3f y=%.3f z=%.3f m/s^2",
+                sample.orientation_x, sample.orientation_y,
+                sample.orientation_z, sample.orientation_w, sample.gravity_x,
+                sample.gravity_y, sample.gravity_z);
+  }
+
+  void captureImuZero(const Bno055::Sample& sample) {
+    imu_zero_orientation_ = {sample.orientation_x, sample.orientation_y,
+                             sample.orientation_z, sample.orientation_w};
+    const double norm = quaternionNorm(imu_zero_orientation_);
+    if (norm < 1e-6) {
+      return;
+    }
+    for (double& component : imu_zero_orientation_) {
+      component /= norm;
+    }
+    imu_zero_orientation_set_ = true;
+    RCLCPP_INFO(
+        get_logger(),
+        "Captured startup IMU zero quaternion x=%.6f y=%.6f z=%.6f w=%.6f",
+        imu_zero_orientation_[0], imu_zero_orientation_[1],
+        imu_zero_orientation_[2], imu_zero_orientation_[3]);
+  }
+
+  std::optional<double> rotationAngleDegrees(
+      const Bno055::Sample& sample) const {
+    const std::array<double, 4> current{
+        sample.orientation_x, sample.orientation_y, sample.orientation_z,
+        sample.orientation_w};
+    const double current_norm = quaternionNorm(current);
+    if (current_norm < 1e-6 || !imu_zero_orientation_set_) {
+      return std::nullopt;
+    }
+
+    const double x = current[0] / current_norm;
+    const double y = current[1] / current_norm;
+    const double z = current[2] / current_norm;
+    const double w = current[3] / current_norm;
+    const double zx = imu_zero_orientation_[0];
+    const double zy = imu_zero_orientation_[1];
+    const double zz = imu_zero_orientation_[2];
+    const double zw = imu_zero_orientation_[3];
+
+    double dx = -w * zx + x * zw - y * zz + z * zy;
+    double dy = -w * zy + x * zz + y * zw - z * zx;
+    double dz = -w * zz - x * zy + y * zx + z * zw;
+    double dw = w * zw + x * zx + y * zy + z * zz;
+    if (dw < 0.0) {
+      dx = -dx;
+      dy = -dy;
+      dz = -dz;
+      dw = -dw;
+    }
+
+    const double vector_norm = std::sqrt(dx * dx + dy * dy + dz * dz);
+    double angle = 2.0 * std::atan2(vector_norm, dw) * 180.0 / kPi;
+    const double dominant_axis =
+        std::abs(dx) >= std::abs(dy) && std::abs(dx) >= std::abs(dz)
+            ? dx
+            : (std::abs(dy) >= std::abs(dz) ? dy : dz);
+    if (dominant_axis < 0.0) {
+      angle = -angle;
+    }
+    return angle;
+  }
+
   // ----- Per-motor ROS interfaces ------------------------------------------
 
-  void setupMotorInterfaces(MotorContext &context) {
-    const std::string &name = context.config.name;
+  void setupMotorInterfaces(MotorContext& context) {
+    const std::string& name = context.config.name;
 
     context.status_pub = create_publisher<titania_extender::msg::MotorStatus>(
         name + "/status", 10);
@@ -327,22 +453,22 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
     context.action_server = rclcpp_action::create_server<MoveToPosition>(
         this, name + "/move_to_position",
-        [this, &context](const rclcpp_action::GoalUUID &,
+        [this, &context](const rclcpp_action::GoalUUID&,
                          MoveToPosition::Goal::ConstSharedPtr goal) {
           return handleGoal(context, *goal);
         },
-        [this, &context](const std::shared_ptr<GoalHandleMove> &) {
+        [this, &context](const std::shared_ptr<GoalHandleMove>&) {
           RCLCPP_INFO(get_logger(), "%s: cancel requested",
                       context.config.name.c_str());
           return rclcpp_action::CancelResponse::ACCEPT;
         },
-        [this, &context](const std::shared_ptr<GoalHandleMove> &goal_handle) {
+        [this, &context](const std::shared_ptr<GoalHandleMove>& goal_handle) {
           handleAccepted(context, goal_handle);
         });
   }
 
-  rclcpp_action::GoalResponse handleGoal(MotorContext &context,
-                                         const MoveToPosition::Goal &goal) {
+  rclcpp_action::GoalResponse handleGoal(MotorContext& context,
+                                         const MoveToPosition::Goal& goal) {
     if (!roboclaw_) {
       RCLCPP_ERROR(get_logger(), "%s: rejecting goal, RoboClaw not connected",
                    context.config.name.c_str());
@@ -358,8 +484,8 @@ class TitaniaExtenderNode : public rclcpp::Node {
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
-  void handleAccepted(MotorContext &context,
-                      const std::shared_ptr<GoalHandleMove> &goal_handle) {
+  void handleAccepted(MotorContext& context,
+                      const std::shared_ptr<GoalHandleMove>& goal_handle) {
     {
       // Preempt any goal already running on this motor. The executing
       // thread notices active_goal changed and finishes as aborted.
@@ -376,25 +502,23 @@ class TitaniaExtenderNode : public rclcpp::Node {
   }
 
   // Clamps a target to the configured limits, warning when clamped.
-  int32_t clampTarget(const MotorConfig &config, int64_t target) {
+  int32_t clampTarget(const MotorConfig& config, int64_t target) {
     const int64_t clamped =
         std::clamp<int64_t>(target, config.min_position, config.max_position);
     if (clamped != target) {
-      RCLCPP_WARN(get_logger(),
-                  "%s: target %ld clamped to %ld (limits [%d, %d])",
-                  config.name.c_str(), static_cast<long>(target),
-                  static_cast<long>(clamped), config.min_position,
-                  config.max_position);
+      RCLCPP_WARN(
+          get_logger(), "%s: target %ld clamped to %ld (limits [%d, %d])",
+          config.name.c_str(), static_cast<long>(target),
+          static_cast<long>(clamped), config.min_position, config.max_position);
     }
     return static_cast<int32_t>(clamped);
   }
 
-  void startSimpleMove(MotorContext &context, int32_t position,
-                       bool relative) {
+  void startSimpleMove(MotorContext& context, int32_t position, bool relative) {
     if (!roboclaw_) {
       return;
     }
-    const MotorConfig &config = context.config;
+    const MotorConfig& config = context.config;
     try {
       int64_t target = position;
       if (relative) {
@@ -406,17 +530,17 @@ class TitaniaExtenderNode : public rclcpp::Node {
                                 static_cast<uint32_t>(config.speed),
                                 static_cast<uint32_t>(config.decel), clamped);
       context.target_position.store(clamped);
-      RCLCPP_INFO(get_logger(), "%s: cmd_position%s -> %d",
-                  config.name.c_str(), relative ? "_relative" : "", clamped);
-    } catch (const RoboClawError &e) {
+      RCLCPP_INFO(get_logger(), "%s: cmd_position%s -> %d", config.name.c_str(),
+                  relative ? "_relative" : "", clamped);
+    } catch (const RoboClawError& e) {
       RCLCPP_ERROR(get_logger(), "%s: cmd_position failed: %s",
                    config.name.c_str(), e.what());
     }
   }
 
-  void executeGoal(MotorContext &context,
-                   const std::shared_ptr<GoalHandleMove> &goal_handle) {
-    const MotorConfig &config = context.config;
+  void executeGoal(MotorContext& context,
+                   const std::shared_ptr<GoalHandleMove>& goal_handle) {
+    const MotorConfig& config = context.config;
     const auto goal = goal_handle->get_goal();
     auto result = std::make_shared<MoveToPosition::Result>();
 
@@ -440,7 +564,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
       }
       target = clampTarget(config, requested);
       roboclaw_->moveToPosition(config.motor, accel, speed, decel, target);
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       result->success = false;
       result->message = std::string("failed to start move: ") + e.what();
       goal_handle->abort(result);
@@ -461,9 +585,9 @@ class TitaniaExtenderNode : public rclcpp::Node {
       if (stop_motor) {
         try {
           roboclaw_->stop(config.motor);
-        } catch (const RoboClawError &e) {
-          RCLCPP_ERROR(get_logger(), "%s: stop failed: %s",
-                       config.name.c_str(), e.what());
+        } catch (const RoboClawError& e) {
+          RCLCPP_ERROR(get_logger(), "%s: stop failed: %s", config.name.c_str(),
+                       e.what());
         }
       }
       std::lock_guard<std::mutex> lock(context.goal_mutex);
@@ -492,7 +616,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
       try {
         encoder = roboclaw_->readEncoder(config.motor).value;
         speed_now = roboclaw_->readSpeed(config.motor);
-      } catch (const RoboClawError &e) {
+      } catch (const RoboClawError& e) {
         result->success = false;
         result->message = std::string("communication error: ") + e.what();
         result->final_position = context.last_encoder.load();
@@ -515,10 +639,8 @@ class TitaniaExtenderNode : public rclcpp::Node {
       // over-current (flag set by the status timer).
       const bool limit_hit =
           limit_switches_->isAvailable() &&
-          ((target < encoder &&
-            limit_switches_->isMinTriggered(config.axis)) ||
-           (target > encoder &&
-            limit_switches_->isMaxTriggered(config.axis)));
+          ((target < encoder && limit_switches_->isMinTriggered(config.axis)) ||
+           (target > encoder && limit_switches_->isMaxTriggered(config.axis)));
       if (limit_hit || context.over_current.load()) {
         result->success = false;
         result->message = limit_hit ? "limit switch triggered" : "over-current";
@@ -570,7 +692,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
   // its minimum limit switch, use the BNO055 gravity vector to confirm the
   // rotation angle, zero the encoders at the reference position, then move
   // to a configured ready position. Not called automatically yet.
-  void homeMotors(std_srvs::srv::Trigger::Response &response) {
+  void homeMotors(std_srvs::srv::Trigger::Response& response) {
     // TODO(wimblerobotics): implement once limit switches and IMU exist.
     RCLCPP_WARN(get_logger(), "homeMotors: not implemented (dummy)");
     response.success = false;
@@ -578,19 +700,20 @@ class TitaniaExtenderNode : public rclcpp::Node {
         "homing not implemented yet; waiting on limit switch and IMU hardware";
   }
 
-  void resetEncoders(std_srvs::srv::Trigger::Response &response) {
+  void resetEncoders(std_srvs::srv::Trigger::Response& response) {
     try {
       roboclaw_->resetEncoders();
       response.success = true;
       response.message = "encoders reset to zero";
       RCLCPP_INFO(get_logger(), "Encoders reset to zero");
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       response.success = false;
       response.message = e.what();
     }
   }
 
-  // ----- Periodic status -------------------------------------------------------
+  // ----- Periodic status
+  // -------------------------------------------------------
 
   void publishStatus() {
     if (!roboclaw_) {
@@ -606,7 +729,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
       temperature = roboclaw_->readTemperature();
       main_battery = roboclaw_->readMainBatteryVoltage();
       error_status = roboclaw_->readErrorStatus();
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "status read failed: %s", e.what());
       return;
@@ -620,10 +743,10 @@ class TitaniaExtenderNode : public rclcpp::Node {
     publishDerivedState();
   }
 
-  void publishMotorStatus(MotorContext &context, const rclcpp::Time &stamp,
-                          float current, float temperature,
-                          float main_battery, uint32_t error_status) {
-    const MotorConfig &config = context.config;
+  void publishMotorStatus(MotorContext& context, const rclcpp::Time& stamp,
+                          float current, float temperature, float main_battery,
+                          uint32_t error_status) {
+    const MotorConfig& config = context.config;
     titania_extender::msg::MotorStatus status;
     status.header.stamp = stamp;
     status.name = config.name;
@@ -634,7 +757,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
       status.encoder_status = encoder.status;
       status.speed = roboclaw_->readSpeed(config.motor);
       context.last_encoder.store(encoder.value);
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "%s: encoder read failed: %s", config.name.c_str(),
                            e.what());
@@ -666,14 +789,41 @@ class TitaniaExtenderNode : public rclcpp::Node {
   }
 
   // Publishes rotation_angle (degrees) and extension_length (meters).
-  // Prefers real sensors (IMU gravity vector, ToF range); falls back to
-  // encoder counts with YAML calibration; publishes NaN when unknown.
+  // Publishes raw IMU/ToF readings as well as derived scalar values.
   void publishDerivedState() {
     std_msgs::msg::Float32 angle;
     angle.data = std::numeric_limits<float>::quiet_NaN();
     if (imu_->isAvailable()) {
-      if (auto degrees = imu_->readRotationAngleDegrees()) {
-        angle.data = static_cast<float>(*degrees);
+      if (auto sample = imu_->readSample()) {
+        if (!imu_zero_orientation_set_) {
+          captureImuZero(*sample);
+        }
+
+        sensor_msgs::msg::Imu imu_message;
+        imu_message.header.stamp = now();
+        imu_message.header.frame_id = "extender_imu";
+        imu_message.orientation.x = sample->orientation_x;
+        imu_message.orientation.y = sample->orientation_y;
+        imu_message.orientation.z = sample->orientation_z;
+        imu_message.orientation.w = sample->orientation_w;
+        imu_message.angular_velocity_covariance[0] = -1.0;
+        imu_message.linear_acceleration_covariance[0] = -1.0;
+        imu_pub_->publish(imu_message);
+
+        geometry_msgs::msg::Vector3Stamped gravity_message;
+        gravity_message.header = imu_message.header;
+        gravity_message.vector.x = sample->gravity_x;
+        gravity_message.vector.y = sample->gravity_y;
+        gravity_message.vector.z = sample->gravity_z;
+        gravity_pub_->publish(gravity_message);
+
+        if (auto degrees = rotationAngleDegrees(*sample)) {
+          angle.data = static_cast<float>(*degrees);
+        }
+      } else if (!imu_->lastError().empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "BNO055 read failed: %s",
+                             imu_->lastError().c_str());
       }
     } else if (rotate_.config.counts_per_unit != 0.0) {
       angle.data = static_cast<float>(rotate_.last_encoder.load() /
@@ -684,8 +834,39 @@ class TitaniaExtenderNode : public rclcpp::Node {
     std_msgs::msg::Float32 length;
     length.data = std::numeric_limits<float>::quiet_NaN();
     if (tof_->isAvailable()) {
-      if (auto meters = tof_->readExtensionMeters()) {
-        length.data = static_cast<float>(*meters);
+      if (auto sample = tof_->readSample()) {
+        sensor_msgs::msg::Range range_message;
+        range_message.header.stamp = now();
+        range_message.header.frame_id = "extender_tof";
+        range_message.radiation_type = sensor_msgs::msg::Range::INFRARED;
+        range_message.field_of_view = 0.314;
+        range_message.min_range = 0.01;
+        range_message.max_range = 1.3;
+        range_message.range = static_cast<float>(sample->distance_meters);
+        tof_range_pub_->publish(range_message);
+
+        std_msgs::msg::UInt8 range_status;
+        range_status.data = sample->range_status;
+        tof_status_pub_->publish(range_status);
+        if (sample->range_status == 0) {
+          const double beam_angle =
+              get_parameter("tof.beam_angle_degrees").as_double() * kPi / 180.0;
+          const double projected_distance =
+              sample->distance_meters * std::cos(beam_angle);
+          length.data = static_cast<float>(
+              projected_distance -
+              get_parameter("tof.mount_offset_meters").as_double());
+        } else {
+          RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 5000,
+              "VL53L4CD raw range %.3f m has quality status %u",
+              sample->distance_meters,
+              static_cast<unsigned int>(sample->range_status));
+        }
+      } else if (!tof_->lastError().empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "VL53L4CD read failed: %s",
+                             tof_->lastError().c_str());
       }
     } else if (extend_.config.counts_per_unit != 0.0) {
       length.data = static_cast<float>(extend_.last_encoder.load() /
@@ -694,7 +875,8 @@ class TitaniaExtenderNode : public rclcpp::Node {
     extension_length_pub_->publish(length);
   }
 
-  // ----- Members ---------------------------------------------------------------
+  // ----- Members
+  // ---------------------------------------------------------------
 
   std::unique_ptr<RoboClaw> roboclaw_;
   std::unique_ptr<Bno055> imu_;
@@ -704,6 +886,13 @@ class TitaniaExtenderNode : public rclcpp::Node {
   MotorContext rotate_;
   MotorContext extend_;
 
+  std::array<double, 4> imu_zero_orientation_{0.0, 0.0, 0.0, 1.0};
+  bool imu_zero_orientation_set_ = false;
+
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gravity_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr tof_range_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr tof_status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr rotation_angle_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr extension_length_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr home_service_;
@@ -713,12 +902,12 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
 }  // namespace titania_extender
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
     auto node = std::make_shared<titania_extender::TitaniaExtenderNode>();
     rclcpp::spin(node);
-  } catch (const titania_extender::RoboClawError &e) {
+  } catch (const titania_extender::RoboClawError& e) {
     RCLCPP_FATAL(rclcpp::get_logger("titania_extender_node"),
                  "RoboClaw error: %s", e.what());
     rclcpp::shutdown();

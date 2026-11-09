@@ -15,6 +15,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
@@ -27,7 +29,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_executable(titania_extender_node
   src/titania_extender_node.cpp
   src/roboclaw.cpp
+  src/bno055.cpp
+  src/vl53l4cd.cpp
 )
+add_executable(i2c_scan src/i2c_scan.cpp)
 target_include_directories(titania_extender_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
@@ -36,6 +41,8 @@ target_link_libraries(titania_extender_node
   rclcpp_action::rclcpp_action
   ${std_msgs_TARGETS}
   ${std_srvs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME}
@@ -43,6 +50,9 @@ rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME}
 target_link_libraries(titania_extender_node "${cpp_typesupport_target}")
 
 install(TARGETS titania_extender_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(TARGETS i2c_scan
   DESTINATION lib/${PROJECT_NAME}
 )
 

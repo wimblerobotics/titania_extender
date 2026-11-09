@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "titania_extender/roboclaw.hpp"
 
 #include <fcntl.h>
@@ -45,26 +46,26 @@ constexpr int kReadTimeoutMs = 100;
 constexpr int kRetries = 3;
 constexpr uint8_t kAck = 0xFF;
 
-void packU32(std::vector<uint8_t> &buffer, uint32_t value) {
+void packU32(std::vector<uint8_t>& buffer, uint32_t value) {
   buffer.push_back(static_cast<uint8_t>(value >> 24));
   buffer.push_back(static_cast<uint8_t>(value >> 16));
   buffer.push_back(static_cast<uint8_t>(value >> 8));
   buffer.push_back(static_cast<uint8_t>(value));
 }
 
-uint32_t unpackU32(const uint8_t *data) {
+uint32_t unpackU32(const uint8_t* data) {
   return (static_cast<uint32_t>(data[0]) << 24) |
          (static_cast<uint32_t>(data[1]) << 16) |
          (static_cast<uint32_t>(data[2]) << 8) | static_cast<uint32_t>(data[3]);
 }
 
-uint16_t unpackU16(const uint8_t *data) {
+uint16_t unpackU16(const uint8_t* data) {
   return static_cast<uint16_t>((data[0] << 8) | data[1]);
 }
 
 }  // namespace
 
-RoboClaw::RoboClaw(const std::string &device_name, uint32_t baud_rate,
+RoboClaw::RoboClaw(const std::string& device_name, uint32_t baud_rate,
                    uint8_t address)
     : device_name_(device_name), baud_rate_(baud_rate), address_(address) {
   openPort();
@@ -95,12 +96,24 @@ void RoboClaw::openPort() {
 
   speed_t baud;
   switch (baud_rate_) {
-    case 9600: baud = B9600; break;
-    case 19200: baud = B19200; break;
-    case 38400: baud = B38400; break;
-    case 57600: baud = B57600; break;
-    case 115200: baud = B115200; break;
-    case 230400: baud = B230400; break;
+    case 9600:
+      baud = B9600;
+      break;
+    case 19200:
+      baud = B19200;
+      break;
+    case 38400:
+      baud = B38400;
+      break;
+    case 57600:
+      baud = B57600;
+      break;
+    case 115200:
+      baud = B115200;
+      break;
+    case 230400:
+      baud = B230400;
+      break;
     default:
       closePort();
       throw RoboClawError("Unsupported baud rate: " +
@@ -139,7 +152,7 @@ void RoboClaw::restartPort() {
   openPort();
 }
 
-void RoboClaw::updateCrc(uint16_t &crc, uint8_t data) {
+void RoboClaw::updateCrc(uint16_t& crc, uint8_t data) {
   crc = crc ^ (static_cast<uint16_t>(data) << 8);
   for (int i = 0; i < 8; i++) {
     if (crc & 0x8000) {
@@ -150,7 +163,7 @@ void RoboClaw::updateCrc(uint16_t &crc, uint8_t data) {
   }
 }
 
-void RoboClaw::writeBytes(const uint8_t *data, size_t length) {
+void RoboClaw::writeBytes(const uint8_t* data, size_t length) {
   size_t written = 0;
   while (written < length) {
     ssize_t result = ::write(fd_, data + written, length - written);
@@ -158,8 +171,7 @@ void RoboClaw::writeBytes(const uint8_t *data, size_t length) {
       if (errno == EINTR) {
         continue;
       }
-      throw RoboClawError(std::string("write failed: ") +
-                          std::strerror(errno));
+      throw RoboClawError(std::string("write failed: ") + std::strerror(errno));
     }
     written += static_cast<size_t>(result);
   }
@@ -191,7 +203,7 @@ uint8_t RoboClaw::readByteWithTimeout() {
 
 void RoboClaw::flushInput() { tcflush(fd_, TCIFLUSH); }
 
-void RoboClaw::writeCommand(uint8_t command, const uint8_t *data,
+void RoboClaw::writeCommand(uint8_t command, const uint8_t* data,
                             size_t length) {
   std::string last_error;
   for (int attempt = 0; attempt < kRetries; attempt++) {
@@ -217,7 +229,7 @@ void RoboClaw::writeCommand(uint8_t command, const uint8_t *data,
         return;
       }
       last_error = "bad ack byte: " + std::to_string(ack);
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       last_error = e.what();
     }
   }
@@ -227,7 +239,7 @@ void RoboClaw::writeCommand(uint8_t command, const uint8_t *data,
   throw RoboClawError(message.str());
 }
 
-void RoboClaw::readCommand(uint8_t command, uint8_t *buffer,
+void RoboClaw::readCommand(uint8_t command, uint8_t* buffer,
                            size_t expected_length) {
   std::string last_error;
   for (int attempt = 0; attempt < kRetries; attempt++) {
@@ -243,14 +255,13 @@ void RoboClaw::readCommand(uint8_t command, uint8_t *buffer,
         buffer[i] = readByteWithTimeout();
         updateCrc(crc, buffer[i]);
       }
-      uint16_t response_crc =
-          static_cast<uint16_t>(readByteWithTimeout()) << 8;
+      uint16_t response_crc = static_cast<uint16_t>(readByteWithTimeout()) << 8;
       response_crc |= readByteWithTimeout();
       if (response_crc == crc) {
         return;
       }
       last_error = "CRC mismatch";
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       last_error = e.what();
     }
   }
@@ -283,8 +294,7 @@ std::string RoboClaw::getVersion() {
         }
         version.push_back(static_cast<char>(byte));
       }
-      uint16_t response_crc =
-          static_cast<uint16_t>(readByteWithTimeout()) << 8;
+      uint16_t response_crc = static_cast<uint16_t>(readByteWithTimeout()) << 8;
       response_crc |= readByteWithTimeout();
       if (response_crc == crc) {
         // Strip trailing newline.
@@ -295,7 +305,7 @@ std::string RoboClaw::getVersion() {
         return version;
       }
       last_error = "CRC mismatch";
-    } catch (const RoboClawError &e) {
+    } catch (const RoboClawError& e) {
       last_error = e.what();
     }
   }
@@ -372,8 +382,7 @@ void RoboClaw::resetEncoders() {
 int32_t RoboClaw::readSpeed(Motor motor) {
   std::lock_guard<std::mutex> lock(mutex_);
   uint8_t buffer[5];
-  readCommand(motor == kM1 ? kGetM1Speed : kGetM2Speed, buffer,
-              sizeof(buffer));
+  readCommand(motor == kM1 ? kGetM1Speed : kGetM2Speed, buffer, sizeof(buffer));
   // buffer[4] is a direction/status byte; the speed is already signed.
   return static_cast<int32_t>(unpackU32(buffer));
 }
@@ -421,7 +430,7 @@ std::string RoboClaw::errorString(uint32_t status) {
   }
   static const struct {
     uint32_t bit;
-    const char *name;
+    const char* name;
   } kBits[] = {
       {0x000001, "e-stop"},
       {0x000002, "temperature error"},
@@ -443,9 +452,19 @@ std::string RoboClaw::errorString(uint32_t status) {
       {0x080000, "main voltage low warning"},
       {0x100000, "temperature warning"},
       {0x200000, "temperature 2 warning"},
+      {0x400000, "S4 signal warning"},
+      {0x800000, "S5 signal warning"},
+      {0x01000000, "M1 speed warning"},
+      {0x02000000, "M2 speed warning"},
+      {0x04000000, "M1 position warning"},
+      {0x08000000, "M2 position warning"},
+      {0x10000000, "CAN bus warning"},
+      {0x20000000, "boot warning"},
+      {0x40000000, "M1 over-regeneration warning"},
+      {0x80000000, "M2 over-regeneration warning"},
   };
   std::string result;
-  for (const auto &entry : kBits) {
+  for (const auto& entry : kBits) {
     if (status & entry.bit) {
       if (!result.empty()) {
         result += ", ";

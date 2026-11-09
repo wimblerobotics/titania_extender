@@ -1,54 +1,46 @@
-// VL53L4CD time-of-flight distance sensor interface for measuring the
-// absolute extension length of the box tube extender.
-//
-// DUMMY IMPLEMENTATION: the sensor is not yet installed. The plan is to
-// measure the distance from a fixed point on the extender to a reflector
-// on the end of the extender. The mounting position will be specified
-// later; mount_offset_meters converts the raw range to extension length.
-//
-// TODO(wimblerobotics): implement I2C communication with the VL53L4CD
-// (default address 0x29) using the ST ULD API register sequence: sensor
-// init, start ranging, poll data-ready, read range, clear interrupt.
-
 #pragma once
+
+// SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace titania_extender {
 
 class Vl53l4cd {
  public:
-  Vl53l4cd(int i2c_bus, uint8_t i2c_address, double mount_offset_meters,
-           bool enabled)
-      : i2c_bus_(i2c_bus),
-        i2c_address_(i2c_address),
-        mount_offset_meters_(mount_offset_meters),
-        enabled_(enabled) {}
+  struct Sample {
+    double distance_meters;
+    uint8_t range_status;
+  };
 
-  bool initialize() {
-    // TODO: open /dev/i2c-<bus>, verify model ID (0xEBAA), load default
-    // configuration, start ranging.
-    available_ = false;
-    return available_;
-  }
+  Vl53l4cd(int i2c_bus, uint8_t i2c_address, bool enabled);
+  ~Vl53l4cd();
 
+  Vl53l4cd(const Vl53l4cd&) = delete;
+  Vl53l4cd& operator=(const Vl53l4cd&) = delete;
+
+  bool initialize();
   bool isAvailable() const { return enabled_ && available_; }
-
-  // Extension length in meters (raw range adjusted by the mounting
-  // offset). Returns std::nullopt until the hardware is implemented.
-  std::optional<double> readExtensionMeters() {
-    // TODO: poll data-ready, read result register (mm), clear interrupt,
-    // return range / 1000.0 - mount_offset_meters_.
-    return std::nullopt;
-  }
+  const std::string& lastError() const { return last_error_; }
+  std::optional<Sample> readSample();
 
  private:
+  bool writeByte(uint16_t reg, uint8_t value);
+  bool writeWord(uint16_t reg, uint16_t value);
+  bool writeDword(uint16_t reg, uint32_t value);
+  bool readByte(uint16_t reg, uint8_t& value);
+  bool readWord(uint16_t reg, uint16_t& value);
+  bool readDword(uint16_t reg, uint32_t& value);
+  bool waitForDataReady();
+
   int i2c_bus_;
   uint8_t i2c_address_;
-  double mount_offset_meters_;
   bool enabled_;
   bool available_ = false;
+  int fd_ = -1;
+  std::string last_error_;
 };
 
 }  // namespace titania_extender

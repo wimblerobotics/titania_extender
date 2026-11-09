@@ -14,18 +14,54 @@ Moves are executed by the RoboClaw in position mode (buffered
 speed/accel/deccel/position commands) with velocity and position PIDs
 configured from the YAML file at startup.
 
-## Status of future hardware (dummy implementations)
+## Sensors
 
 | Hardware | Purpose | Status |
 |----------|---------|--------|
-| BNO055 IMU | Rotation angle from the gravity vector | Dummy ([bno055.hpp](include/titania_extender/bno055.hpp)) |
-| VL53L4CD ToF | Absolute extension length to a reflector | Dummy ([vl53l4cd.hpp](include/titania_extender/vl53l4cd.hpp)) |
+| BNO055 IMU | Orientation and gravity vector | Enabled; publishes quaternion and gravity ([bno055.hpp](include/titania_extender/bno055.hpp)) |
+| VL53L4CD ToF | Distance to the end reflector | Enabled; publishes raw range ([vl53l4cd.hpp](include/titania_extender/vl53l4cd.hpp)) |
 | Limit switches | Min/max travel stops (optical or hall effect, 3-pin) | Dummy ([limit_switches.hpp](include/titania_extender/limit_switches.hpp)) |
 | Homing | Home motors on startup using IMU + limit switches | Dummy (`homeMotors()`, exposed as the `home` service, never called automatically) |
 
-Until the sensors exist, `rotation_angle` and `extension_length` fall back
-to encoder counts scaled by the `counts_per_degree` / `counts_per_meter`
-calibration values in the YAML file (and publish `NaN` while those are 0.0).
+The node publishes `imu/data` (`sensor_msgs/Imu`, including the quaternion),
+`imu/gravity` (`geometry_msgs/Vector3Stamped`, m/s^2),
+`extender_tof/range` (`sensor_msgs/Range`, raw meters), and
+`extender_tof/range_status` (`std_msgs/UInt8`,
+mapped VL53L4CD ranging status). IMU messages use the `extender_imu` frame ID;
+ToF range messages use `extender_tof`. These frame names are published now;
+the corresponding URDF elements can be added later. The raw ToF distance is
+published whenever the sensor has a measurement, including measurements with a
+nonzero status; check `extender_tof/range_status` when assessing its quality.
+`extension_length` is
+updated only for status-zero measurements, by projecting the raw distance onto
+the tube axis using `tof.beam_angle_degrees` and subtracting
+`tof.mount_offset_meters`. The beam angle is initially configured to the
+approximate 9-degree mounting angle and the offset remains uncalibrated.
+The node also publishes `rotation_angle` relative to the configured IMU zero
+orientation. Until an IMU reference is configured,
+the quaternion at node startup is captured as zero; place the extender at its
+zero-angle position before starting the node. Copy the reported orientation
+into `imu.zero_orientation` and set `imu.zero_orientation_set: true` to preserve
+the reference across restarts. Raw IMU values remain available to verify the
+installation. The current zero-angle calculation uses the relative
+orientation quaternion; gravity is separately published so the mounting and
+angle convention can be checked.
+
+The VL53L4CD raw measurement is useful for calibration before setting
+`tof.mount_offset_meters`; the current reflector setup means that offset should
+be measured rather than assumed. The node initializes the
+configured sensors and logs initialization errors. It needs permission to
+open `/dev/i2c-<bus>`.
+
+To manually scan every standard address on a bus, run the separate utility:
+
+```bash
+ros2 run titania_extender i2c_scan 1
+```
+
+Replace `1` with the bus number. Like `i2cdetect`, a full scan probes devices
+using SMBus quick writes or receive-byte reads, depending on address and
+adapter capabilities; probing can affect some devices on the bus.
 
 ## Interfaces
 
@@ -47,6 +83,8 @@ Published:
 * `rotate/status`, `extend/status`
   ([MotorStatus](msg/MotorStatus.msg)) — encoder, speed, current,
   temperature, voltage, error flags, target, limits. Rate: `sensor_rate_hz`.
+  `error_status` contains errors in its low 16 bits and warnings in its high
+  16 bits; `error_string` decodes both.
 * `rotation_angle` (`std_msgs/Float32`) — degrees.
 * `extension_length` (`std_msgs/Float32`) — meters.
 
@@ -71,7 +109,34 @@ settings.
 
 Note: at startup the driver resets both encoders, i.e. **the power-on
 physical position is position 0**. This will be replaced by a homing
-procedure once the limit switches and IMU are installed.
+procedure once the limit switches and IMU are supported.
+
+## Device permissions
+
+Install the included [udev rule](udev/99-titania-extender.rules) on the
+Raspberry Pi to create `/dev/roboclaw` and give members of `dialout` read/write
+access to the RoboClaw and `/dev/i2c-1`:
+
+```bash
+cd ~/titania_extender
+sudo install -m 0644 src/titania_extender/udev/99-titania-extender.rules /etc/udev/rules.d/
+sudo usermod -aG dialout "$USER"
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add /sys/class/tty/ttyACM0 /sys/class/i2c-dev/i2c-1
+sudo udevadm settle
+```
+
+Log out and back in so the user's new group membership takes effect. If the
+RoboClaw is not currently `ttyACM0`, use its actual sysfs path in the trigger
+command, or reconnect it. Verify with `id`, `ls -l /dev/roboclaw /dev/i2c-1`
+and `test -r /dev/i2c-1 && test -w /dev/i2c-1`.
+
+The USB rule matches the connected Basicmicro RoboClaw 2x15A by vendor,
+product and device strings rather than its changing `ttyACM` number. It has
+no unique serial number, so multiple matching controllers require a
+device-specific rule to avoid a symlink conflict. The I2C rule applies only
+to bus 1; adjust it if the configured sensor buses differ. Other existing
+udev rules or ACLs may also grant access.
 
 ## Building
 
@@ -123,4 +188,6 @@ ros2 run titania_extender titania_extender_node --ros-args \
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Project code is licensed under the Apache License 2.0; see [LICENSE](LICENSE).
+The VL53L4CD initialization values from STMicroelectronics retain their
+BSD-3-Clause notice in [vl53l4cd.cpp](src/vl53l4cd.cpp).

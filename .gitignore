@@ -4,3 +4,6 @@ log/
 __pycache__/
 *.pyc
 .vscode/
+!.vscode/
+.vscode/*
+!.vscode/settings.json

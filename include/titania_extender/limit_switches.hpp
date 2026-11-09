@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Motion limit stop sensors (optical or hall-effect, 3-pin devices) for
 // the extender rotation and extension axes.
 //

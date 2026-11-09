@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // RoboClaw packet-serial protocol driver for the titania_extender package.
 //
 // Implements the subset of the Basic Micro RoboClaw command set needed to
@@ -26,7 +27,7 @@ namespace titania_extender {
 
 class RoboClawError : public std::runtime_error {
  public:
-  explicit RoboClawError(const std::string &what) : std::runtime_error(what) {}
+  explicit RoboClawError(const std::string& what) : std::runtime_error(what) {}
 };
 
 class RoboClaw {
@@ -39,12 +40,11 @@ class RoboClaw {
   };
 
   // Opens the serial device. Throws RoboClawError on failure.
-  RoboClaw(const std::string &device_name, uint32_t baud_rate,
-           uint8_t address);
+  RoboClaw(const std::string& device_name, uint32_t baud_rate, uint8_t address);
   ~RoboClaw();
 
-  RoboClaw(const RoboClaw &) = delete;
-  RoboClaw &operator=(const RoboClaw &) = delete;
+  RoboClaw(const RoboClaw&) = delete;
+  RoboClaw& operator=(const RoboClaw&) = delete;
 
   std::string getVersion();
 
@@ -62,16 +62,16 @@ class RoboClaw {
   void moveToPosition(Motor motor, uint32_t accel, uint32_t speed,
                       uint32_t decel, int32_t position, bool immediate = true);
 
-  EncoderResult readEncoder(Motor motor);        // commands 16/17
-  void setEncoder(Motor motor, int32_t value);   // commands 22/23
-  void resetEncoders();                          // command 20
-  int32_t readSpeed(Motor motor);                // commands 18/19, QPPS
+  EncoderResult readEncoder(Motor motor);       // commands 16/17
+  void setEncoder(Motor motor, int32_t value);  // commands 22/23
+  void resetEncoders();                         // command 20
+  int32_t readSpeed(Motor motor);               // commands 18/19, QPPS
 
-  std::pair<float, float> readCurrents();        // command 49, amps (m1, m2)
-  float readTemperature();                       // command 82, degrees C
-  float readMainBatteryVoltage();                // command 24, volts
-  float readLogicBatteryVoltage();               // command 25, volts
-  uint32_t readErrorStatus();                    // command 90
+  std::pair<float, float> readCurrents();  // command 49, amps (m1, m2)
+  float readTemperature();                 // command 82, degrees C
+  float readMainBatteryVoltage();          // command 24, volts
+  float readLogicBatteryVoltage();         // command 25, volts
+  uint32_t readErrorStatus();              // command 90
   static std::string errorString(uint32_t status);
 
   // Command buffer depth for (m1, m2). 0x80 => buffer empty (move done),
@@ -87,17 +87,17 @@ class RoboClaw {
   void closePort();
   void restartPort();
 
-  static void updateCrc(uint16_t &crc, uint8_t data);
+  static void updateCrc(uint16_t& crc, uint8_t data);
 
   // Writes [address, command, data..., crc] and waits for the 0xFF ack.
   // Retries internally; throws RoboClawError on persistent failure.
-  void writeCommand(uint8_t command, const uint8_t *data, size_t length);
+  void writeCommand(uint8_t command, const uint8_t* data, size_t length);
 
   // Writes [address, command], reads expected_length bytes + 2 CRC bytes,
   // validates the CRC. Retries internally; throws on persistent failure.
-  void readCommand(uint8_t command, uint8_t *buffer, size_t expected_length);
+  void readCommand(uint8_t command, uint8_t* buffer, size_t expected_length);
 
-  void writeBytes(const uint8_t *data, size_t length);
+  void writeBytes(const uint8_t* data, size_t length);
   uint8_t readByteWithTimeout();
   void flushInput();
 

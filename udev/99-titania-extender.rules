@@ -1,0 +1,5 @@
+# Basicmicro USB RoboClaw 2x15A.
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="2404", ATTRS{manufacturer}=="Basicmicro Inc.", ATTRS{product}=="USB Roboclaw 2x15A", GROUP="dialout", MODE="0660", SYMLINK+="roboclaw"
+
+# Raspberry Pi I2C bus used by the IMU and ToF sensor.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-1", GROUP="dialout", MODE="0660"
