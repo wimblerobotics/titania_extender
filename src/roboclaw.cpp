@@ -379,6 +379,13 @@ void RoboClaw::resetEncoders() {
   writeCommand(kResetEnc, nullptr, 0);
 }
 
+void RoboClaw::driveSpeed(Motor motor, int32_t speed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<uint8_t> data;
+  packU32(data, static_cast<uint32_t>(speed));
+  writeCommand(motor == kM1 ? 35 : 36, data.data(), data.size());
+}
+
 int32_t RoboClaw::readSpeed(Motor motor) {
   std::lock_guard<std::mutex> lock(mutex_);
   uint8_t buffer[5];

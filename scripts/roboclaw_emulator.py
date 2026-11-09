@@ -38,6 +38,7 @@ class Motor:
         self.target = 0.0
         self.speed = 0.0  # commanded speed magnitude, qpps
         self.moving = False
+        self.velocity_mode = False
         self.last_update = time.monotonic()
 
     def update(self):
@@ -45,6 +46,9 @@ class Motor:
         dt = now - self.last_update
         self.last_update = now
         if not self.moving:
+            return
+        if self.velocity_mode:
+            self.position += self.speed * dt
             return
         remaining = self.target - self.position
         step = self.speed * dt
@@ -58,6 +62,8 @@ class Motor:
     def velocity(self) -> int:
         if not self.moving:
             return 0
+        if self.velocity_mode:
+            return int(self.speed)
         return int(self.speed if self.target > self.position else -self.speed)
 
 
@@ -70,6 +76,8 @@ WRITE_LENGTHS = {
     29: 16,  # set velocity PID
     32: 2,
     33: 2,  # duty
+    35: 4,
+    36: 4,  # signed speed
     61: 28,
     62: 28,  # set position PID
     65: 17,
@@ -84,6 +92,7 @@ class Emulator:
 
     def __init__(self, link: str):
         self.master, slave = os.openpty()
+        self.slave = slave
         slave_name = os.ttyname(slave)
         if os.path.lexists(link):
             os.unlink(link)
@@ -125,12 +134,19 @@ class Emulator:
         elif command in (32, 33):
             motor = self.motors[command - 32]
             motor.moving = False  # zero duty stop
+        elif command in (35, 36):
+            motor = self.motors[command - 35]
+            motor.update()
+            motor.speed = float(struct.unpack('>i', payload)[0])
+            motor.velocity_mode = True
+            motor.moving = motor.speed != 0
         elif command in (65, 66):
             motor = self.motors[command - 65]
             _accel, speed, _decel, position = struct.unpack(
                 ">IIIi", payload[:16])
             motor.update()
             motor.target = float(position)
+            motor.velocity_mode = False
             motor.speed = float(max(speed, 1))
             motor.moving = True
             print(f"M{command - 64}: move to {position} at {speed} qpps",

@@ -61,6 +61,22 @@ install(DIRECTORY config launch
 )
 
 if(BUILD_TESTING)
+  enable_testing()
+  add_executable(homing_test test/homing_test.cpp)
+  target_include_directories(homing_test PRIVATE include)
+  add_test(NAME homing_test COMMAND homing_test)
+  add_executable(homing_test_node
+    src/titania_extender_node.cpp src/roboclaw.cpp test/fake_sensors.cpp)
+  target_include_directories(homing_test_node PRIVATE include)
+  target_link_libraries(homing_test_node
+    rclcpp::rclcpp rclcpp_action::rclcpp_action
+    ${std_msgs_TARGETS} ${std_srvs_TARGETS} ${geometry_msgs_TARGETS}
+    ${sensor_msgs_TARGETS} "${cpp_typesupport_target}")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME homing_integration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_homing.py
+      $<TARGET_FILE:homing_test_node>)
+  set_tests_properties(homing_integration PROPERTIES TIMEOUT 90)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()

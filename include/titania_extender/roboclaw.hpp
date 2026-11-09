@@ -65,6 +65,7 @@ class RoboClaw {
   EncoderResult readEncoder(Motor motor);       // commands 16/17
   void setEncoder(Motor motor, int32_t value);  // commands 22/23
   void resetEncoders();                         // command 20
+  void driveSpeed(Motor motor, int32_t speed);  // commands 35/36, signed QPPS
   int32_t readSpeed(Motor motor);               // commands 18/19, QPPS
 
   std::pair<float, float> readCurrents();  // command 49, amps (m1, m2)

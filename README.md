@@ -21,7 +21,7 @@ configured from the YAML file at startup.
 | BNO055 IMU | Orientation and gravity vector | Enabled; publishes quaternion and gravity ([bno055.hpp](include/titania_extender/bno055.hpp)) |
 | VL53L4CD ToF | Distance to the end reflector | Enabled; publishes raw range ([vl53l4cd.hpp](include/titania_extender/vl53l4cd.hpp)) |
 | Limit switches | Min/max travel stops (optical or hall effect, 3-pin) | Dummy ([limit_switches.hpp](include/titania_extender/limit_switches.hpp)) |
-| Homing | Home motors on startup using IMU + limit switches | Dummy (`homeMotors()`, exposed as the `home` service, never called automatically) |
+| Homing | Home extension using ToF, then rotation using IMU gravity | Explicit `home` service; never called automatically |
 
 The node publishes `imu/data` (`sensor_msgs/Imu`, including the quaternion),
 `imu/gravity` (`geometry_msgs/Vector3Stamped`, m/s^2),
@@ -96,8 +96,75 @@ Subscribed (fire-and-forget moves using YAML default speed/accel/decel):
 
 ### Services
 
-* `home` (`std_srvs/Trigger`) — homing procedure (dummy; not implemented).
+* `home` (`std_srvs/Trigger`) — home extension, then rotation; responds when
+  finished or failed.
+* `cancel_home` (`std_srvs/Trigger`) — request a stop of active homing.
 * `reset_encoders` (`std_srvs/Trigger`) — zero both encoders.
+
+### Homing
+
+With the node running and the mechanism clear to move:
+
+```bash
+ros2 service call /home std_srvs/srv/Trigger "{}"
+# From another terminal, to cancel:
+ros2 service call /cancel_home std_srvs/srv/Trigger "{}"
+```
+
+The extension uses the same status-zero ToF projection and mounting offset as
+`extension_length`, not encoder-derived length or an external topic subscription.
+It moves to **0.100 m +/- 0.005 m**, stops, and zeros M2's encoder.
+Rotation then uses the signed IMU XY-plane gravity angle relative to
+**(0.22, 9.80, -0.18) m/s^2**, captured at inclinometer-confirmed zero,
+stops within **1 degree**, and zeros M1.
+Each axis must remain in tolerance with zero measured speed for five fresh
+sensor samples before zeroing. Their stationary average must also be in tolerance
+so filter lag during motion cannot falsely accept an overshoot.
+The current IMU quaternion is captured at rotation
+home, making `rotation_angle` zero there for this run. Raw gravity is unchanged.
+Encoder fallback length, when configured and ToF is unavailable, includes the
+0.1 m home offset; homing itself always requires both physical sensors.
+
+Homing applies an exponential moving average to valid ToF-derived lengths and
+gravity-derived angles (`homing.smoothing_alpha: 0.35`; 1.0 disables smoothing).
+Raw IMU/ToF topics and the published `extension_length` and `rotation_angle`
+remain unfiltered. Invalid readings still abort homing, and gaps longer than the
+sensor timeout reset the filter history rather than refreshing stale data.
+Both axes slow proportionally within their approach distances (30 mm extension,
+8 degrees rotation), down to 60/30 QPPS respectively. They stop inside 80% of
+the tolerance, then remain stopped unless the averaged reading leaves the full
+tolerance. An axis already within tolerance when its homing phase starts settles
+without moving. This hysteresis avoids restarting for every small fluctuation.
+The final reference check also uses averaged, fresh measurements.
+
+Gravity can reference tilt, not rotation about world vertical. This implementation
+assumes rotation about IMU Z (gravity changes in the XY plane), as indicated by
+the supplied home and raised readings. It rejects gravity magnitudes outside
+8--11 m/s^2 or Z changes greater than 0.5 m/s^2 from the home reference.
+Positive extension counts increase length; **negative rotation counts raise
+the extender**. These directions and all tolerances are configured under
+`homing` in [config/titania_extender.yaml](config/titania_extender.yaml).
+
+Homing uses low signed velocity commands, intentionally bypassing the normal
+encoder position limits because the starting encoder reference is unknown.
+Separate total encoder-travel caps (including reversals), a per-axis timeout,
+sensor freshness checks, controller faults, current limits, and available limit
+switches stop the procedure on failure. The extension travel cap defaults to
+16,000 counts, covering the 13,000-count stroke plus margin for corrections.
+Keep this cap above the full stroke when changing the configured travel range.
+Limit switches are currently unavailable,
+so keep a hardware emergency stop accessible during initial validation.
+Calibrate `tof.mount_offset_meters` and verify the conservative homing speeds and
+travel caps before use. Default homing speeds are 300 QPPS for rotation and
+600 QPPS for extension. The normal extension speed is not used for homing.
+The sensor rate must be fast enough for `homing.sensor_timeout_seconds`.
+
+Active action goals must finish or be canceled before homing. Existing
+fire-and-forget motion is stopped when homing starts; new movement commands and
+encoder resets are rejected during homing. Cancellation or failure stops both
+motors and returns `success: false` with the reason. An axis already successfully
+homed remains zeroed if the next axis fails; retry the complete procedure.
+Success leaves motors stopped, not actively holding a position.
 
 ## Configuration
 
@@ -108,8 +175,8 @@ speed/accel/decel, current limits, calibration values, and dummy-sensor
 settings.
 
 Note: at startup the driver resets both encoders, i.e. **the power-on
-physical position is position 0**. This will be replaced by a homing
-procedure once the limit switches and IMU are supported.
+physical position is position 0** until you explicitly call `home`.
+Startup does not move the mechanism or establish a physical home reference.
 
 ## Device permissions
 
@@ -175,9 +242,24 @@ ros2 topic echo /extend/status
 
 ## Testing without hardware
 
+After building with `-DBUILD_TESTING=ON` and sourcing `install/setup.bash`:
+
+```bash
+ctest --test-dir build/titania_extender -R '^homing_(test|integration)$' --output-on-failure
+```
+
+These tests cover gravity geometry, motor directions, full two-axis homing,
+repeat homing, encoder resets and published references, ordinary moves after
+homing, command exclusion, cancellation, bad/stale sensors, controller faults,
+over-current, timeouts, travel limits, noisy full-stroke convergence, near-home
+hysteresis, speed reduction, and filter reset on invalid/stale samples.
+Integration tests use a separate
+test-only node linked to simulated sensors and the serial emulator, in an
+isolated ROS domain. They do not connect to physical hardware.
+
 [scripts/roboclaw_emulator.py](scripts/roboclaw_emulator.py) emulates the
 RoboClaw protocol subset used by the driver, including a simple motion
-model:
+model for position and velocity commands:
 
 ```bash
 python3 src/titania_extender/scripts/roboclaw_emulator.py &

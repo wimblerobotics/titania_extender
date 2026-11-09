@@ -19,7 +19,7 @@
 //     extension_length               (std_msgs/Float32, meters)
 //   imu/data, imu/gravity, extender_tof/range, extender_tof/range_status
 //   Services:
-//     home            (std_srvs/Trigger)  -- dummy, not yet implemented
+//     home, cancel_home (std_srvs/Trigger)
 //     reset_encoders  (std_srvs/Trigger)
 
 #include <algorithm>
@@ -45,6 +45,7 @@
 
 #include "titania_extender/action/move_to_position.hpp"
 #include "titania_extender/bno055.hpp"
+#include "titania_extender/homing.hpp"
 #include "titania_extender/limit_switches.hpp"
 #include "titania_extender/msg/motor_status.hpp"
 #include "titania_extender/roboclaw.hpp"
@@ -137,10 +138,24 @@ class TitaniaExtenderNode : public rclcpp::Node {
     setupMotorInterfaces(rotate_);
     setupMotorInterfaces(extend_);
 
+    home_callback_group_ =
+        create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     home_service_ = create_service<std_srvs::srv::Trigger>(
-        "home", [this](const std_srvs::srv::Trigger::Request::SharedPtr,
-                       std_srvs::srv::Trigger::Response::SharedPtr response) {
+        "home",
+        [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+               std_srvs::srv::Trigger::Response::SharedPtr response) {
           homeMotors(*response);
+        },
+        rclcpp::ServicesQoS(), home_callback_group_);
+    cancel_home_service_ = create_service<std_srvs::srv::Trigger>(
+        "cancel_home",
+        [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+               std_srvs::srv::Trigger::Response::SharedPtr response) {
+          cancel_home_.store(true);
+          response->success = homing_.load();
+          response->message = response->success
+                                  ? "homing cancellation requested"
+                                  : "homing is not active";
         });
     reset_encoders_service_ = create_service<std_srvs::srv::Trigger>(
         "reset_encoders",
@@ -178,6 +193,26 @@ class TitaniaExtenderNode : public rclcpp::Node {
     declare_parameter("goal_tolerance", 10);
     declare_parameter("goal_timeout_seconds", 30.0);
     declare_parameter("do_debug", false);
+    declare_parameter("homing.extension_meters", 0.1);
+    declare_parameter("homing.extension_tolerance_meters", 0.005);
+    declare_parameter("homing.rotation_tolerance_degrees", 1.0);
+    declare_parameter("homing.smoothing_alpha", 0.35);
+    declare_parameter("homing.extension_approach_meters", 0.03);
+    declare_parameter("homing.rotation_approach_degrees", 8.0);
+    declare_parameter("homing.extend_min_speed", 60);
+    declare_parameter("homing.rotate_min_speed", 30);
+    declare_parameter("homing.gravity.x", 0.22);
+    declare_parameter("homing.gravity.y", 9.80);
+    declare_parameter("homing.gravity.z", -0.18);
+    declare_parameter("homing.rotate_direction", -1);
+    declare_parameter("homing.extend_direction", 1);
+    declare_parameter("homing.rotate_speed", 300);
+    declare_parameter("homing.extend_speed", 600);
+    declare_parameter("homing.rotate_max_travel_counts", 6000);
+    declare_parameter("homing.extend_max_travel_counts", 16000);
+    declare_parameter("homing.timeout_seconds", 60.0);
+    declare_parameter("homing.sensor_timeout_seconds", 0.5);
+    declare_parameter("homing.settle_samples", 5);
 
     for (const std::string prefix : {"rotate", "extend"}) {
       declare_parameter(prefix + ".velocity_p", 0.0);
@@ -284,9 +319,7 @@ class TitaniaExtenderNode : public rclcpp::Node {
                   config.min_position, config.max_position);
     }
 
-    // Startup policy: assume the current physical position is zero.
-    // TODO: replace with a homing procedure using the IMU and limit
-    // switches (see homeMotors()).
+    // Retain the startup coordinate policy; this is not sensor homing.
     roboclaw_->resetEncoders();
     roboclaw_->stopAll();
     RCLCPP_INFO(get_logger(), "Encoders reset; current position is zero");
@@ -383,11 +416,10 @@ class TitaniaExtenderNode : public rclcpp::Node {
       component /= norm;
     }
     imu_zero_orientation_set_ = true;
-    RCLCPP_INFO(
-        get_logger(),
-        "Captured startup IMU zero quaternion x=%.6f y=%.6f z=%.6f w=%.6f",
-        imu_zero_orientation_[0], imu_zero_orientation_[1],
-        imu_zero_orientation_[2], imu_zero_orientation_[3]);
+    RCLCPP_INFO(get_logger(),
+                "Captured IMU zero quaternion x=%.6f y=%.6f z=%.6f w=%.6f",
+                imu_zero_orientation_[0], imu_zero_orientation_[1],
+                imu_zero_orientation_[2], imu_zero_orientation_[3]);
   }
 
   std::optional<double> rotationAngleDegrees(
@@ -469,6 +501,10 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
   rclcpp_action::GoalResponse handleGoal(MotorContext& context,
                                          const MoveToPosition::Goal& goal) {
+    if (homing_.load()) {
+      RCLCPP_WARN(get_logger(), "Rejecting move while homing");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
     if (!roboclaw_) {
       RCLCPP_ERROR(get_logger(), "%s: rejecting goal, RoboClaw not connected",
                    context.config.name.c_str());
@@ -486,6 +522,14 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
   void handleAccepted(MotorContext& context,
                       const std::shared_ptr<GoalHandleMove>& goal_handle) {
+    std::lock_guard<std::mutex> motion_lock(motion_mutex_);
+    if (homing_.load()) {
+      auto result = std::make_shared<MoveToPosition::Result>();
+      result->success = false;
+      result->message = "homing is active";
+      goal_handle->abort(result);
+      return;
+    }
     {
       // Preempt any goal already running on this motor. The executing
       // thread notices active_goal changed and finishes as aborted.
@@ -515,6 +559,11 @@ class TitaniaExtenderNode : public rclcpp::Node {
   }
 
   void startSimpleMove(MotorContext& context, int32_t position, bool relative) {
+    std::lock_guard<std::mutex> motion_lock(motion_mutex_);
+    if (homing_.load()) {
+      RCLCPP_WARN(get_logger(), "Ignoring position command while homing");
+      return;
+    }
     if (!roboclaw_) {
       return;
     }
@@ -688,19 +737,286 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
   // ----- Services ------------------------------------------------------------
 
-  // DUMMY homing procedure. Planned behavior: drive each axis slowly toward
-  // its minimum limit switch, use the BNO055 gravity vector to confirm the
-  // rotation angle, zero the encoders at the reference position, then move
-  // to a configured ready position. Not called automatically yet.
   void homeMotors(std_srvs::srv::Trigger::Response& response) {
-    // TODO(wimblerobotics): implement once limit switches and IMU exist.
-    RCLCPP_WARN(get_logger(), "homeMotors: not implemented (dummy)");
     response.success = false;
-    response.message =
-        "homing not implemented yet; waiting on limit switch and IMU hardware";
+    {
+      std::lock_guard<std::mutex> motion_lock(motion_mutex_);
+      for (MotorContext* context : {&rotate_, &extend_}) {
+        std::lock_guard<std::mutex> goal_lock(context->goal_mutex);
+        if (context->active_goal && context->active_goal->is_active()) {
+          response.message = "finish or cancel active move goals before homing";
+          RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+          return;
+        }
+      }
+      cancel_home_.store(false);
+      homing_.store(true);
+    }
+    try {
+      validateHomingParameters();
+      if (!imu_->isAvailable() || !tof_->isAvailable()) {
+        throw std::runtime_error(
+            "homing requires available IMU and ToF sensors");
+      }
+      // Check both streams before moving either axis.
+      homingReading(false);
+      homingReading(true);
+      roboclaw_->stopAll();
+      RCLCPP_INFO(get_logger(), "Homing extension, then rotation");
+      homeAxis(extend_, false);
+      homeAxis(rotate_, true);
+      if (std::abs(homingReading(false).value -
+                   get_parameter("homing.extension_meters").as_double()) >
+              get_parameter("homing.extension_tolerance_meters").as_double() ||
+          std::abs(homingReading(true).value) >
+              get_parameter("homing.rotation_tolerance_degrees").as_double()) {
+        throw std::runtime_error(
+            "home reference drifted while homing other axis");
+      }
+      response.success = true;
+      response.message =
+          "homed: extension and rotation at configured references; "
+          "both encoders zero";
+      RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
+    } catch (const std::exception& e) {
+      response.message = e.what();
+      RCLCPP_ERROR(get_logger(), "Homing failed: %s", e.what());
+    }
+    for (MotorContext* context : {&rotate_, &extend_}) {
+      try {
+        roboclaw_->stop(context->config.motor);
+      } catch (const RoboClawError& e) {
+        response.success = false;
+        response.message += std::string("; stop failed: ") + e.what();
+        RCLCPP_ERROR(get_logger(), "Homing stop failed: %s", e.what());
+      }
+      context->move_active.store(false);
+    }
+    homing_.store(false);
+  }
+
+  void validateHomingParameters() {
+    for (const std::string name :
+         {"extension_tolerance_meters", "rotation_tolerance_degrees",
+          "extension_approach_meters", "rotation_approach_degrees",
+          "timeout_seconds", "sensor_timeout_seconds"}) {
+      const double value = get_parameter("homing." + name).as_double();
+      if (!std::isfinite(value) || value <= 0.0) {
+        throw std::runtime_error("homing." + name +
+                                 " must be finite and positive");
+      }
+    }
+    averageHomingReading(
+        0.0, 0.0, get_parameter("homing.smoothing_alpha").as_double(), false);
+    if (get_parameter("homing.extension_approach_meters").as_double() <=
+            get_parameter("homing.extension_tolerance_meters").as_double() ||
+        get_parameter("homing.rotation_approach_degrees").as_double() <=
+            get_parameter("homing.rotation_tolerance_degrees").as_double()) {
+      throw std::runtime_error(
+          "homing approach distances must exceed tolerances");
+    }
+    const double target = get_parameter("homing.extension_meters").as_double();
+    if (!std::isfinite(target) || target <= 0.0 ||
+        get_parameter("homing.settle_samples").as_int() < 2) {
+      throw std::runtime_error(
+          "invalid homing extension target or settle_samples");
+    }
+    gravityAngleDegrees(get_parameter("homing.gravity.x").as_double(),
+                        get_parameter("homing.gravity.y").as_double(),
+                        get_parameter("homing.gravity.z").as_double(),
+                        get_parameter("homing.gravity.x").as_double(),
+                        get_parameter("homing.gravity.y").as_double(),
+                        get_parameter("homing.gravity.z").as_double());
+    for (const std::string axis : {"rotate", "extend"}) {
+      const auto direction =
+          get_parameter("homing." + axis + "_direction").as_int();
+      const auto speed = get_parameter("homing." + axis + "_speed").as_int();
+      const auto min_speed =
+          get_parameter("homing." + axis + "_min_speed").as_int();
+      const auto travel =
+          get_parameter("homing." + axis + "_max_travel_counts").as_int();
+      const auto qpps =
+          axis == "rotate" ? rotate_.config.qpps : extend_.config.qpps;
+      if (std::abs(direction) != 1 || speed <= 0 || speed > qpps ||
+          min_speed <= 0 || min_speed > speed || travel <= 0 ||
+          travel > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(
+            "invalid homing direction, maximum/minimum speed or travel for " +
+            axis);
+      }
+    }
+  }
+
+  struct HomingReading {
+    double value;
+    double raw_value;
+    std::chrono::steady_clock::time_point stamp;
+  };
+
+  // Called under sensor_mutex_. Only fresh, valid physical samples advance
+  // the filter; a gap or invalid measurement discards its history.
+  void updateHomingReading(std::optional<HomingReading>& reading, double value,
+                           bool rotation) {
+    try {
+      const auto stamp = std::chrono::steady_clock::now();
+      const double alpha = get_parameter("homing.smoothing_alpha").as_double();
+      const double max_age =
+          get_parameter("homing.sensor_timeout_seconds").as_double();
+      const bool continuous =
+          reading &&
+          std::chrono::duration<double>(stamp - reading->stamp).count() <=
+              max_age;
+      const double previous = continuous ? reading->value : value;
+      reading = HomingReading{
+          averageHomingReading(previous, value, alpha, rotation), value, stamp};
+    } catch (const std::runtime_error& e) {
+      reading.reset();
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Invalid homing sensor filter: %s", e.what());
+    }
+  }
+
+  HomingReading homingReading(bool rotation) {
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
+    const auto& reading = rotation ? rotation_reading_ : extension_reading_;
+    const double max_age =
+        get_parameter("homing.sensor_timeout_seconds").as_double();
+    if (!reading || !std::isfinite(reading->value) ||
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      reading->stamp)
+                .count() > max_age) {
+      throw std::runtime_error(rotation ? "invalid or stale gravity"
+                                        : "invalid or stale extension length");
+    }
+    return *reading;
+  }
+
+  void homeAxis(MotorContext& context, bool rotation) {
+    const std::string axis = rotation ? "rotate" : "extend";
+    const auto motor = context.config.motor;
+    const int speed = get_parameter("homing." + axis + "_speed").as_int();
+    const int min_speed =
+        get_parameter("homing." + axis + "_min_speed").as_int();
+    const int direction =
+        get_parameter("homing." + axis + "_direction").as_int();
+    const auto travel_limit =
+        get_parameter("homing." + axis + "_max_travel_counts").as_int();
+    const double target =
+        rotation ? 0.0 : get_parameter("homing.extension_meters").as_double();
+    const double tolerance =
+        get_parameter(rotation ? "homing.rotation_tolerance_degrees"
+                               : "homing.extension_tolerance_meters")
+            .as_double();
+    const double approach_distance =
+        get_parameter(rotation ? "homing.rotation_approach_degrees"
+                               : "homing.extension_approach_meters")
+            .as_double();
+    const auto started = std::chrono::steady_clock::now();
+    const double timeout = get_parameter("homing.timeout_seconds").as_double();
+    int64_t previous_encoder = roboclaw_->readEncoder(motor).value;
+    int64_t travel = 0;
+    int settled = 0;
+    double stopped_error_sum = 0.0;
+    bool stopped = false;
+    // An axis already inside tolerance should not move just to enter the
+    // narrower stop band used during an approach.
+    bool settling = true;
+    auto previous_sample = std::chrono::steady_clock::time_point{};
+    context.move_active.store(true);
+    while (rclcpp::ok() && !cancel_home_.load()) {
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        started)
+              .count() > timeout) {
+        throw std::runtime_error(axis + " homing timed out");
+      }
+      const auto reading = homingReading(rotation);
+      homingReading(!rotation);
+      const int64_t encoder = roboclaw_->readEncoder(motor).value;
+      travel += std::abs(encoder - previous_encoder);
+      previous_encoder = encoder;
+      if (travel >= travel_limit) {
+        throw std::runtime_error(
+            axis + " homing travel limit exceeded (" + std::to_string(travel) +
+            "/" + std::to_string(travel_limit) + " counts; filtered reading " +
+            std::to_string(reading.value) + (rotation ? " degrees)" : " m)"));
+      }
+      const auto currents = roboclaw_->readCurrents();
+      if (currents.first > rotate_.config.max_current ||
+          currents.second > extend_.config.max_current) {
+        throw std::runtime_error("over-current while homing");
+      }
+      if ((roboclaw_->readErrorStatus() & 0xffffu) != 0) {
+        throw std::runtime_error("RoboClaw fault while homing");
+      }
+      const int command =
+          homingSpeed(target - reading.value, tolerance, approach_distance,
+                      speed, min_speed, direction, settling);
+      if (limit_switches_->isAvailable() &&
+          ((command < 0 &&
+            limit_switches_->isMinTriggered(context.config.axis)) ||
+           (command > 0 &&
+            limit_switches_->isMaxTriggered(context.config.axis)))) {
+        throw std::runtime_error(axis + " homing limit switch triggered");
+      }
+      if (command == 0) {
+        roboclaw_->stop(motor);
+        if (stopped && reading.stamp != previous_sample) {
+          if (roboclaw_->readSpeed(motor) == 0) {
+            ++settled;
+            stopped_error_sum +=
+                rotation ? std::remainder(target - reading.raw_value, 360.0)
+                         : target - reading.raw_value;
+          } else {
+            settled = 0;
+            stopped_error_sum = 0.0;
+          }
+        }
+        stopped = true;
+        // Check a stationary average too: the moving EMA can lag behind
+        // the mechanism and otherwise accept an overshoot as home.
+        if (settled >= get_parameter("homing.settle_samples").as_int() &&
+            std::abs(stopped_error_sum / settled) <= tolerance) {
+          if (cancel_home_.load() || !rclcpp::ok()) {
+            throw std::runtime_error("homing canceled or node shutting down");
+          }
+          if (rotation) {
+            std::lock_guard<std::mutex> lock(sensor_mutex_);
+            if (!latest_imu_sample_) {
+              throw std::runtime_error("missing IMU orientation at home");
+            }
+            captureImuZero(*latest_imu_sample_);
+          }
+          roboclaw_->setEncoder(motor, 0);
+          if (roboclaw_->readEncoder(motor).value != 0) {
+            throw std::runtime_error(axis +
+                                     " encoder reset verification failed");
+          }
+          context.last_encoder.store(0);
+          context.target_position.store(0);
+          context.move_active.store(false);
+          RCLCPP_INFO(get_logger(), "%s homed; encoder zeroed", axis.c_str());
+          return;
+        }
+      } else {
+        settled = 0;
+        stopped_error_sum = 0.0;
+        stopped = false;
+        roboclaw_->driveSpeed(motor, command);
+      }
+      previous_sample = reading.stamp;
+      std::this_thread::sleep_for(50ms);
+    }
+    throw std::runtime_error("homing canceled or node shutting down");
   }
 
   void resetEncoders(std_srvs::srv::Trigger::Response& response) {
+    std::lock_guard<std::mutex> motion_lock(motion_mutex_);
+    if (homing_.load()) {
+      response.success = false;
+      response.message = "cannot reset encoders while homing";
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      return;
+    }
     try {
       roboclaw_->resetEncoders();
       response.success = true;
@@ -791,10 +1107,26 @@ class TitaniaExtenderNode : public rclcpp::Node {
   // Publishes rotation_angle (degrees) and extension_length (meters).
   // Publishes raw IMU/ToF readings as well as derived scalar values.
   void publishDerivedState() {
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
     std_msgs::msg::Float32 angle;
     angle.data = std::numeric_limits<float>::quiet_NaN();
     if (imu_->isAvailable()) {
       if (auto sample = imu_->readSample()) {
+        latest_imu_sample_ = *sample;
+        try {
+          updateHomingReading(
+              rotation_reading_,
+              gravityAngleDegrees(
+                  sample->gravity_x, sample->gravity_y, sample->gravity_z,
+                  get_parameter("homing.gravity.x").as_double(),
+                  get_parameter("homing.gravity.y").as_double(),
+                  get_parameter("homing.gravity.z").as_double()),
+              true);
+        } catch (const std::runtime_error& e) {
+          rotation_reading_.reset();
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                               "Homing gravity invalid: %s", e.what());
+        }
         if (!imu_zero_orientation_set_) {
           captureImuZero(*sample);
         }
@@ -849,14 +1181,14 @@ class TitaniaExtenderNode : public rclcpp::Node {
         range_status.data = sample->range_status;
         tof_status_pub_->publish(range_status);
         if (sample->range_status == 0) {
-          const double beam_angle =
-              get_parameter("tof.beam_angle_degrees").as_double() * kPi / 180.0;
-          const double projected_distance =
-              sample->distance_meters * std::cos(beam_angle);
-          length.data = static_cast<float>(
-              projected_distance -
+          const double meters = extensionLength(
+              sample->distance_meters,
+              get_parameter("tof.beam_angle_degrees").as_double(),
               get_parameter("tof.mount_offset_meters").as_double());
+          length.data = static_cast<float>(meters);
+          updateHomingReading(extension_reading_, meters, false);
         } else {
+          extension_reading_.reset();
           RCLCPP_WARN_THROTTLE(
               get_logger(), *get_clock(), 5000,
               "VL53L4CD raw range %.3f m has quality status %u",
@@ -869,8 +1201,9 @@ class TitaniaExtenderNode : public rclcpp::Node {
                              tof_->lastError().c_str());
       }
     } else if (extend_.config.counts_per_unit != 0.0) {
-      length.data = static_cast<float>(extend_.last_encoder.load() /
-                                       extend_.config.counts_per_unit);
+      length.data = static_cast<float>(
+          get_parameter("homing.extension_meters").as_double() +
+          extend_.last_encoder.load() / extend_.config.counts_per_unit);
     }
     extension_length_pub_->publish(length);
   }
@@ -885,6 +1218,13 @@ class TitaniaExtenderNode : public rclcpp::Node {
 
   MotorContext rotate_;
   MotorContext extend_;
+  std::mutex motion_mutex_;
+  std::mutex sensor_mutex_;
+  std::atomic<bool> homing_{false};
+  std::atomic<bool> cancel_home_{false};
+  std::optional<HomingReading> rotation_reading_;
+  std::optional<HomingReading> extension_reading_;
+  std::optional<Bno055::Sample> latest_imu_sample_;
 
   std::array<double, 4> imu_zero_orientation_{0.0, 0.0, 0.0, 1.0};
   bool imu_zero_orientation_set_ = false;
@@ -896,6 +1236,8 @@ class TitaniaExtenderNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr rotation_angle_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr extension_length_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr home_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_home_service_;
+  rclcpp::CallbackGroup::SharedPtr home_callback_group_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_encoders_service_;
   rclcpp::TimerBase::SharedPtr status_timer_;
 };
@@ -906,7 +1248,10 @@ int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
     auto node = std::make_shared<titania_extender::TitaniaExtenderNode>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(),
+                                                      2);
+    executor.add_node(node);
+    executor.spin();
   } catch (const titania_extender::RoboClawError& e) {
     RCLCPP_FATAL(rclcpp::get_logger("titania_extender_node"),
                  "RoboClaw error: %s", e.what());
